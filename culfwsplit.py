@@ -20,6 +20,7 @@
 
 import argparse
 from contextlib import ExitStack
+from telnetlib import Telnet
 import os
 import pty
 from selectors import DefaultSelector as Selector, EVENT_READ
@@ -27,20 +28,37 @@ import sys
 import tty
 
 
-def run(num_ports, loopback=False, debug=False):
+def run(num_ports, telnetaddr, port, debug=False):
     """Creates several serial ports. When data is received from one port, sends
-    to all the other ports."""
-
+    to respective culfw slot."""
+    #Has to be done line by line, as commands might mix up
+    if debug:
+        print('Connecting to',telnetaddr,'on',port)
+    try:
+        t_obj = Telnet(telnetaddr,port)
+    except Exception as e:
+        print('Error opening telnet:')
+        print(e)
+        return
     master_files = {}  # Dict of master fd to master file object.
     slave_names = {}  # Dict of master fd to slave name.
-    for _ in range(num_ports):
+    master_num = {} # Dict of master index to fd
+    slave_num = {} # Dict of slaves fd to index
+    print('0 port as telnet');
+    for idx in range(num_ports):
         master_fd, slave_fd = pty.openpty()
         tty.setraw(master_fd)
         os.set_blocking(master_fd, False)
         slave_name = os.ttyname(slave_fd)
-        master_files[master_fd] = open(master_fd, 'r+b', buffering=0)
+        master_files[master_fd] = open(master_fd, 'r+b',buffering=0)
+        master_num[idx+1] = master_fd
         slave_names[master_fd] = slave_name
-        print(slave_name)
+        print(idx+1, 'port as', slave_name)
+        slave_num[master_fd]=idx
+
+    master_files[t_obj.fileno()]=t_obj
+    slave_names[t_obj.fileno()]='telnet'
+    master_num[0]= t_obj.fileno()
 
     with Selector() as selector, ExitStack() as stack:
         # Context manage all the master file objects, and add to selector.
@@ -52,21 +70,33 @@ def run(num_ports, loopback=False, debug=False):
                 for key, events in selector.select():
                     if not events & EVENT_READ:
                         continue
-
-                    data = master_files[key.fileobj].read()
+                    if slave_names[key.fileobj] == 'telnet':
+                        data = master_files[key.fileobj].read_until(b'\r\n',2)
+                        #write to slot
+                        cnt= data.count(b'*',0,5)
+                        print ('count',cnt, 'fd',slave_names[master_num[cnt+1]])
+                        master_files[master_num[cnt+1]].write(data.lstrip(b'*'*cnt))
+                    else:
+                        newline = False
+                        data=b''
+                        while not newline:
+                           try:
+                               data += master_files[key.fileobj].read()
+                           except:
+                               pass
+                           if data.count(b'\n')>0: newline = True
+                        #write to telnet
+                        data= data.rjust(len(data)+slave_num[key.fileobj],b'*')
+                        master_files[master_num[0]].write(data)
                     if debug:
                         print(slave_names[key.fileobj], data, file=sys.stderr)
 
-                    # Write to master files. If loopback is False, don't write
-                    # to the sending file.
-                    for fd, f in master_files.items():
-                        if loopback or fd != key.fileobj:
-                            f.write(data)
-        except (KeyboardInterrupt, BaseException):
+#        except (KeyboardInterrupt, BaseException):
+        except Exception as e:
+            print(e)
             # Closing all FDs
             for fd, f in master_files.items():
-                fd.Close()
-
+                f.close()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -74,17 +104,19 @@ def main():
         'available until the program exits. Once set up, the port names be '
         'printed to stdout, one per line.'
     )
-    parser.add_argument('num_ports', type=int,
-                        help='number of ports to create')
-    parser.add_argument('-l', '--loopback', action='store_true',
-                        help='echo data back to the sending device too')
+    parser.add_argument('-s','--serials', type=int, default=4,
+                        help='number of ports to stack')
+    parser.add_argument('telnetaddr',type=str,
+                        help='address of CUN')
+    parser.add_argument('-p','--port', type=int, default=2323,
+			help='port of CUN')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='log received data to stderr')
     args = parser.parse_args()
 
     # Catch KeyboardInterrupt so it doesn't print traceback.
     try:
-        run(args.num_ports, args.loopback, args.debug)
+        run(args.serials, args.telnetaddr, args.port, args.debug)
     except KeyboardInterrupt:
         pass
 
